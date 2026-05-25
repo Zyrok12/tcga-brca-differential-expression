@@ -280,9 +280,7 @@ Important limitations:
 
 ---
 
-## Skills Demonstrated
-
-This project demonstrates:
+## Skills
 
 - R/Bioconductor workflow development;
 - RNA-seq count data analysis;
@@ -295,21 +293,3 @@ This project demonstrates:
 - pathway enrichment analysis;
 - reproducible scientific reporting with R Markdown.
 
----
-
-## Author
-
-**Bruno Young de Castro**
-
-M.Sc. Genomics, Informatics, Mathematics & AI for Health and Environment  
-Université Paris-Saclay
-
-Background in computational genomics, epigenomics, pharmacogenomics, molecular simulation, and ML/AI for biomedical research.
-
----
-
-## Suggested Citation / Attribution
-
-This repository is a portfolio mini-project developed for educational and professional demonstration purposes using public TCGA-BRCA data.
-
-TCGA data are provided through the Genomic Data Commons.
