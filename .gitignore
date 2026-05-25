@@ -1,0 +1,39 @@
+# R/RStudio
+.Rhistory
+.RData
+.Ruserdata
+.Rproj.user/
+*.Rproj
+
+# R Markdown outputs
+*.html
+*.pdf
+*.docx
+*_cache/
+*_files/
+
+# Downloaded TCGA/GDC data
+GDCdata/
+data/raw/
+data/processed/
+*.rds
+*.RDS
+*.rda
+*.RData
+
+# Large result files
+results/tables/*.csv
+results/tables/*.tsv
+results/tables/*.xlsx
+results/figures/*.png
+results/figures/*.jpg
+results/figures/*.jpeg
+results/figures/*.pdf
+
+# System files
+.DS_Store
+Thumbs.db
+
+# Temporary files
+*.tmp
+*.log

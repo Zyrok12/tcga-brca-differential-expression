@@ -1,0 +1,384 @@
+---
+title: "BRCA Differential Analysis"
+---
+
+```{r}
+##Tools needed for data cleaning, analysis and presentation
+if (!require("BiocManager", quietly = TRUE))
+    install.packages("BiocManager")
+
+BiocManager::install(c(
+    "TCGAbiolinks",      # Download TCGA
+    "DESeq2",            # Our DE (Differential Expression) software
+    "EnhancedVolcano",   # volcano plots
+    "clusterProfiler",   # enrichment
+    "org.Hs.eg.db"       # human gene annotation
+))
+
+install.packages(c(
+    "tidyverse",         # data wrangling + ggplot2
+    "survival",          # survival models
+    "survminer",         # survival plots
+    "pheatmap",          # heatmaps
+    "glmnet",            # classifier (LASSO/Ridge)
+    "caret"              # classifier framework
+))
+```
+
+```{r}
+library(TCGAbiolinks)
+library(SummarizedExperiment)
+
+query <- GDCquery(
+    project = "TCGA-BRCA",
+    data.category = "Transcriptome Profiling",
+    data.type = "Gene Expression Quantification",
+    workflow.type = "STAR - Counts"  # gives raw counts, what DESeq2 needs
+) #This will directly obtain all the data we want
+
+
+GDCdownload(query, method = "api", files.per.chunk = 10) # Creates a folder in my working directory
+
+se <- GDCprepare(query)
+
+se                        # shows dimensions (genes x samples)
+assay(se, "unstranded")   # the raw count matrix (genes as rows, samples as cols)
+colData(se)               # sample metadata (tumor type, patient info, survival, etc.)
+rowData(se)               # gene metadata (Ensembl IDs, gene names, etc.)
+```
+
+```{r}
+library(DESeq2)
+
+#Building DESeq2
+dds <- DESeqDataSet(se, design = ~ sample_type) #design = What we want to compare
+
+# sample_type will be "Primary Tumor" vs "Solid Tissue Normal"
+table(colData(se)$sample_type)
+
+# Filtering = keep genes with at least 10 counts in at least 10 samples
+keep <- rowSums(counts(dds) >= 10) >= 10
+dds <- dds[keep, ]
+
+#DESeq2 pipeline (normalization + dispersion + testing)
+dds <- DESeq(dds)
+
+res <- results(dds,
+    contrast = c("sample_type", "Primary Tumor", "Solid Tissue Normal"), # Extract tumor vs normal
+    alpha = 0.05          # FDR threshold
+)
+
+summary(res)            
+res_df <- as.data.frame(res)  #Conversion to df for future analysis
+
+sig_genes <- res_df[  #Significant Genes
+    !is.na(res_df$padj) &
+    res_df$padj < 0.05 &
+    abs(res_df$log2FoldChange) > 1,   # at least 2-fold change
+]
+
+nrow(sig_genes)  # how many significant DEGs I found
+```
+
+
+```{r}
+library(EnhancedVolcano)
+library(pheatmap)
+library(ggplot2)
+
+# Select only the top significant genes to label, instead of labelling everything
+# This makes the volcano plot much cleaner
+top_volcano_genes <- rownames(sig_genes[
+    order(sig_genes$padj, -abs(sig_genes$log2FoldChange)),
+])[1:min(20, nrow(sig_genes))]
+
+volcano <- EnhancedVolcano(
+  res_df,
+  lab = rownames(res_df),
+  selectLab = top_volcano_genes,
+  x = "log2FoldChange",
+  y = "padj",
+  xlab = bquote(~Log[2]~"fold change"),
+  ylab = bquote(~-Log[10]~"adjusted p-value"),
+  pCutoff = 0.05,
+  FCcutoff = 1,
+  title = "TCGA-BRCA: Primary Tumor vs Solid Tissue Normal",
+  subtitle = "DESeq2 differential expression analysis",
+  caption = "Cutoffs: padj < 0.05, |log2FC| > 1",
+  pointSize = 1.8,
+  labSize = 3.5,
+  drawConnectors = TRUE,
+  widthConnectors = 0.4,
+  boxedLabels = TRUE,
+  legendPosition = "right",
+  legendLabSize = 10,
+  legendIconSize = 3,
+  colAlpha = 0.8
+) #Volcano plot, scatter plot used to quickly identify statistically significant changes in large datasets --> specially used in RNAseq data such as this one
+
+volcano
+
+
+# Normalization of counts
+vsd <- vst(dds, blind = FALSE)   # variance stabilizing transformation
+
+
+top10 <- head(sig_genes[order(sig_genes$padj), ], 10) #top 50 genes by adj p-val
+mat <- assay(vsd)[rownames(top10), ]
+
+
+mat_scaled <- t(scale(t(mat))) # Scale by gene | Colors show expression levels
+
+# Annotation bar showing tumor vs normal
+annotation_col <- data.frame(
+    SampleType = colData(dds)$sample_type,
+    row.names = colnames(mat)
+)
+
+#Colors for visual representation
+# IMPORTANT: the name here must match the annotation column name: SampleType
+ann_colors <- list(
+  SampleType = c(
+    "Solid Tissue Normal" = "#2980B9",
+    "Primary Tumor" = "#E74C3C",
+    "Metastatic" = "#8E44AD"
+  )
+)
+
+# Order samples by sample type to make Tumor vs Normal visually clearer
+sample_order <- order(annotation_col$SampleType)
+
+mat_scaled_ordered <- mat_scaled[, sample_order]
+annotation_col_ordered <- annotation_col[sample_order, , drop = FALSE]
+
+heatmap <- pheatmap(
+  mat_scaled_ordered,
+  annotation_col = annotation_col_ordered,
+  annotation_colors = ann_colors,
+  show_colnames = FALSE,
+  show_rownames = TRUE,
+  fontsize_row = 7,
+  cluster_rows = TRUE,
+  cluster_cols = FALSE,
+  border_color = NA,
+  main = "Top 50 Differentially Expressed Genes: TCGA-BRCA",
+  color = colorRampPalette(c("#2166AC", "white", "#B2182B"))(100)
+)
+
+```
+
+```{r}
+library(survival)
+library(survminer)
+
+# Two main things we are extracting from the metadata:
+# - time(days)
+# - event: Death (0/1)
+
+clinical <- as.data.frame(colData(se))
+
+# Use only tumour samples for survival analysis
+tumor_samples <- clinical$sample_type == "Primary Tumor"
+clinical <- clinical[tumor_samples, ]
+vsd_tumor <- vsd[, tumor_samples]
+
+# TCGA survival columns
+# Common ones: days_to_death, days_to_last_follow_up, vital_status
+
+clinical$days_to_death <- as.numeric(clinical$days_to_death)
+clinical$days_to_last_follow_up <- as.numeric(clinical$days_to_last_follow_up)
+
+clinical$OS_time <- ifelse(
+    !is.na(clinical$days_to_death),
+    clinical$days_to_death,
+    clinical$days_to_last_follow_up
+)
+
+clinical$OS_event <- ifelse(clinical$vital_status == "Dead", 1, 0)
+
+# Optional: survival time in years, easier to read in the graph
+clinical$OS_years <- clinical$OS_time / 365.25
+
+# Kaplan-Meier curve for survival
+# Gene picked: ERBB2
+
+# Check exact ERBB2 row name first
+grep("ENSG00000141736", rownames(assay(vsd_tumor)), value = TRUE)
+
+# ERBB2 Ensembl ID without version number
+erbb2_id <- "ENSG00000141736"
+
+# Find the exact row, allowing for Ensembl version numbers such as ENSG00000141736.14
+erbb2_row <- grep(
+    paste0("^", erbb2_id, "(\\.|$)"),
+    rownames(assay(vsd_tumor)),
+    value = TRUE
+)
+
+if (length(erbb2_row) == 0) {
+    stop("ERBB2 was not found in the expression matrix. Check the Ensembl ID.")
+}
+
+# If your data has version number, this automatically uses the correct exact row
+gene_counts <- assay(vsd_tumor)[erbb2_row[1], ]
+
+# Match expression values to clinical rows
+gene_counts <- gene_counts[rownames(clinical)]
+
+clinical$gene_group <- ifelse(
+    gene_counts > median(gene_counts, na.rm = TRUE),
+    "High",
+    "Low"
+)
+
+clinical$gene_group <- factor(clinical$gene_group, levels = c("Low", "High"))
+
+clinical <- clinical[
+    !is.na(clinical$OS_time) &
+    !is.na(clinical$OS_event) &
+    !is.na(clinical$gene_group),
+]
+
+fit <- survfit(Surv(OS_years, OS_event) ~ gene_group, data = clinical)
+
+survival_plot <- ggsurvplot(fit,
+    data = clinical,
+    pval = TRUE,              # shows log-rank p-value on plot
+    pval.method = TRUE,       # shows the test method
+    risk.table = TRUE,        # adds number at risk table below
+    conf.int = TRUE,
+    palette = c("#2980B9", "#E74C3C"),
+    title = "Overall Survival by ERBB2 Expression",
+    subtitle = "TCGA-BRCA Primary Tumor Samples",
+    xlab = "Time in years",
+    ylab = "Survival Probability",
+    legend.title = "ERBB2 expression",
+    legend.labs = c("Low", "High"),
+    break.time.by = 2,
+    risk.table.height = 0.25,
+    risk.table.y.text.col = TRUE,
+    risk.table.y.text = FALSE,
+    ggtheme = theme_minimal()
+)
+
+survival_plot
+
+#Extra: Cox proportional hazards model: Tests whether a variable is a significant predictor of survival
+cox_model <- coxph(Surv(OS_years, OS_event) ~ gene_group, data = clinical)
+summary(cox_model)
+# Look at: exp(coef) = hazard ratio, p-value
+
+```
+
+
+```{r}
+library(glmnet)
+
+##I will perform a LASSO logistic regression to predict tumor from normal gene expressions (standard)
+
+# Prepare matrix (samples x genes)
+X <- t(assay(vsd))                          # transpose from previous samples x genes
+y <- ifelse(colData(dds)$sample_type == "Primary Tumor", 1, 0)
+
+#Train/test split (80/20)
+set.seed(42)
+train_idx <- sample(1:nrow(X), 0.8 * nrow(X))
+X_train <- X[train_idx, ];  y_train <- y[train_idx]
+X_test  <- X[-train_idx, ]; y_test  <- y[-train_idx]
+
+#Cross-validated LASSO --> Lambda optimization
+cv_fit <- cv.glmnet(X_train, y_train,
+    family = "binomial",    # logistic regression
+    alpha = 1,              # alpha=1 is LASSO || alpha=0 is Ridge (future analysis)
+    nfolds = 10
+)
+
+plot(cv_fit)  # shows error of our cross-validation vs lambda — pick lambda.min or lambda.1se
+
+# Prediction on test set
+pred_prob <- predict(cv_fit, X_test, s = "lambda.min", type = "response")
+pred_class <- ifelse(pred_prob > 0.5, 1, 0)
+
+# Evaluation
+table(Predicted = pred_class, Actual = y_test)   # confusion matrix
+mean(pred_class == y_test)                       # accuracy
+
+#Gene selection by LASSO
+coefs <- coef(cv_fit, s = "lambda.min")
+selected <- coefs[coefs[,1] != 0, ]   # non-zero coefficients = selected genes
+```
+
+
+```{r}
+library(clusterProfiler)
+library(org.Hs.eg.db)
+library(enrichplot)
+library(stringr)
+library(ggplot2)
+
+## Pathway enrichment to understand which biological processes are affected
+
+gene_list <- rownames(sig_genes) #ID of sig genes
+
+
+
+gene_list_clean <- sub("\\..*", "", gene_list)#Remove Ensembl version numbers if present
+# Example: ENSG00000141510.18 -> ENSG00000141510
+
+#Convert Ensembl IDs to Entrez IDs
+entrez_ids <- bitr(
+  gene_list_clean,
+  fromType = "ENSEMBL",
+  toType = "ENTREZID",
+  OrgDb = org.Hs.eg.db
+)
+
+#Remove duplicated Entrez IDs
+entrez_ids_unique <- unique(entrez_ids$ENTREZID)
+
+# Create background/universe using all genes tested by DESeq2
+# This is statistically better than using all human genes as the background
+background_genes <- rownames(res_df)
+background_genes_clean <- sub("\\..*", "", background_genes)
+
+background_entrez <- bitr(
+  background_genes_clean,
+  fromType = "ENSEMBL",
+  toType = "ENTREZID",
+  OrgDb = org.Hs.eg.db
+)
+
+background_entrez_unique <- unique(background_entrez$ENTREZID)
+
+#Run Gene Ontology (GO) Biological Process enrichment for better biological understanding
+ego <- enrichGO(
+  gene = entrez_ids_unique,
+  universe = background_entrez_unique,
+  OrgDb = org.Hs.eg.db,
+  keyType = "ENTREZID",
+  ont = "BP",
+  pAdjustMethod = "BH",
+  pvalueCutoff = 0.05,
+  qvalueCutoff = 0.05,
+  readable = TRUE
+)
+
+head(as.data.frame(ego))
+
+go_plot <- dotplot(
+  ego,
+  showCategory = 15,
+  font.size = 10,
+  title = "GO Biological Process Enrichment"
+) +
+  scale_y_discrete(labels = function(x) stringr::str_wrap(x, width = 45)) +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(size = 14, face = "bold"),
+    axis.text.y = element_text(size = 9),
+    axis.text.x = element_text(size = 9)
+  )
+
+go_plot #plotting of most enriched pathways
+```
+
